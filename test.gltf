@@ -1,266 +1,705 @@
-import * as THREE from 'three';
-import { FullScreenQuad } from 'three/examples/jsm/postprocessing/Pass.js';
-import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { PathTracingSceneGenerator } from '../src/core/PathTracingSceneGenerator.js';
-import { MeshoptDecoder } from 'three/examples/jsm/libs/meshopt_decoder.module.js';
-import { GUI } from 'three/examples/jsm/libs/lil-gui.module.min.js';
-import { AmbientOcclusionMaterial } from '../src/materials/surface/AmbientOcclusionMaterial.js';
-import Stats from 'three/examples/jsm/libs/stats.module.js';
-import { MeshBVHUniformStruct } from 'three-mesh-bvh';
-import * as MikkTSpace from 'three/examples/jsm/libs/mikktspace.module.js';
-import { mergeVertices, computeMikkTSpaceTangents } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
-
-let renderer, controls, camera, scene, stats;
-let fsQuad, target1, target2, materials;
-let samplesEl, samples, totalSamples;
-const params = {
-
-	renderScale: 1 / window.devicePixelRatio,
-	radius: 2.0,
-	samplesPerFrame: 2.0,
-	accumulate: true,
-	pause: false,
-
-};
-
-init();
-
-async function init() {
-
-	// initialize renderer
-	renderer = new THREE.WebGLRenderer( { antialias: true } );
-	document.body.appendChild( renderer.domElement );
-
-	fsQuad = new FullScreenQuad( new THREE.MeshBasicMaterial( { transparent: true } ) );
-
-	camera = new THREE.PerspectiveCamera( 75, window.innerWidth / window.innerHeight, 0.1, 200 );
-	camera.position.set( - 4, 2, 3 );
-
-	scene = new THREE.Scene();
-
-	controls = new OrbitControls( camera, renderer.domElement );
-	controls.addEventListener( 'change', () => {
-
-		reset();
-
-	} );
-
-	samplesEl = document.getElementById( 'samples' );
-
-	// will be null if extension not supported
-	const floatLinearExtensionSupported = renderer.extensions.get( 'OES_texture_float_linear' );
-
-	// initialize render targs
-	target1 = new THREE.WebGLRenderTarget( 1, 1, { type: floatLinearExtensionSupported ? THREE.FloatType : THREE.HalfFloatType, colorSpace: THREE.LinearSRGBColorSpace } );
-
-	target2 = new THREE.WebGLRenderTarget( 1, 1, { type: floatLinearExtensionSupported ? THREE.FloatType : THREE.HalfFloatType, colorSpace: THREE.LinearSRGBColorSpace } );
-
-	materials = [];
-
-
-	//const url = 'https://raw.githubusercontent.com/KhronosGroup/glTF-Sample-Models/master/2.0/FlightHelmet/glTF/FlightHelmet.gltf'; /Users/symbol/three-gpu-pathtracer/example/floors.glb
-	const url = '/Users/symbol/three-gpu-pathtracer/example/floors2.gltf';
-	const gltfPromise = new GLTFLoader()
-		.setMeshoptDecoder( MeshoptDecoder )
-		.loadAsync( url )
-		.then( async gltf => {
-
-			const group = new THREE.Group();
-
-			// scale the scene to a reasonable size
-			const box = new THREE.Box3();
-			box.setFromObject( gltf.scene );
-
-			const sphere = new THREE.Sphere();
-			box.getBoundingSphere( sphere );
-
-			gltf.scene.scale.setScalar( 2.5 / sphere.radius );
-			gltf.scene.position.y = - 0.25 * ( box.max.y - box.min.y ) * 2.5 / sphere.radius;
-			gltf.scene.updateMatrixWorld();
-			group.add( gltf.scene );
-
-			// position the floor
-			box.setFromObject( gltf.scene );
-
-			const floor = new THREE.Mesh(
-				new THREE.CylinderGeometry( 3, 3, 0.05, 200 ),
-				new THREE.MeshStandardMaterial( { color: 0x1a1a1a } ),
-			);
-			floor.geometry.clearGroups();
-			floor.position.y = box.min.y - 0.025;
-			group.add( floor );
-
-			await MikkTSpace.ready;
-
-			// requires bundle support for top level await
-			group.traverse( c => {
-
-				if ( c.geometry ) {
-
-					const geometry = c.geometry;
-
-					if ( ! ( 'tangent' in geometry.attributes ) && 'normal' in geometry.attributes && 'uv' in geometry.attributes ) {
-
-						c.geometry = computeMikkTSpaceTangents( geometry, MikkTSpace );
-						c.geometry = mergeVertices( geometry );
-
-					}
-
-				}
-
-			} );
-
-			group.updateMatrixWorld( true );
-
-			return {
-				...new PathTracingSceneGenerator( group ).generate(),
-				scene: group,
-			};
-
-		} )
-		.then( result => {
-
-			const { bvh } = result;
-
-			const bvhUniform = new MeshBVHUniformStruct();
-			bvhUniform.updateFrom( bvh );
-
-			// TODO: for some reason creating multiple materials _really_ slows down the rendering?
-			const materialMap = new Map();
-			const group = result.scene;
-			group.traverse( c => {
-
-				// reuse materials as much as possible since different ones cause slow down
-				if ( c.isMesh ) {
-
-					const normalMap = c.material.normalMap;
-					if ( ! materialMap.has( normalMap ) ) {
-
-						const material = new AmbientOcclusionMaterial( {
-
-							bvh: bvhUniform,
-							normalScale: c.material.normalScale,
-							normalMap,
-							normalMapType: c.material.normalMapType,
-
-						} );
-						materialMap.set( normalMap, material );
-						materials.push( material );
-
-					}
-
-					c.material = materialMap.get( normalMap );
-
-				}
-
-			} );
-			scene.add( group );
-
-		} );
-
-	await gltfPromise;
-
-	document.getElementById( 'loading' ).remove();
-
-	onResize();
-	window.addEventListener( 'resize', onResize );
-
-	const gui = new GUI();
-	gui.add( params, 'renderScale', 0.1, 1 ).onChange( onResize );
-	gui.add( params, 'samplesPerFrame', 1, 10, 1 );
-	gui.add( params, 'radius', 0, 4 ).onChange( reset );
-	gui.add( params, 'accumulate' ).onChange( reset );
-	gui.add( params, 'pause' );
-
-	stats = new Stats();
-	document.body.appendChild( stats.domElement );
-
-	reset();
-	animate();
-
-}
-
-function onResize() {
-
-	const w = window.innerWidth;
-	const h = window.innerHeight;
-	const dpr = window.devicePixelRatio * params.renderScale;
-
-	target1.setSize( w * dpr, h * dpr );
-	target2.setSize( w * dpr, h * dpr );
-
-	renderer.setSize( w, h );
-	renderer.setPixelRatio( window.devicePixelRatio );
-	camera.aspect = w / h;
-	camera.updateProjectionMatrix();
-	reset();
-
-}
-
-function reset() {
-
-	samples = 0;
-	totalSamples = 0;
-
-}
-
-function animate() {
-
-	requestAnimationFrame( animate );
-
-	stats.update();
-
-	// update all the material parameters
-	materials.forEach( material => {
-
-		if ( ! params.pause ) {
-
-			material.seed ++;
-
-		}
-
-		material.radius = params.radius;
-		material.setDefine( 'SAMPLES', params.samplesPerFrame );
-
-	} );
-
-	// update the render targets if it's a first frame or not paused
-	if ( samples === 0 || ! params.pause ) {
-
-		samples ++;
-		totalSamples += params.samplesPerFrame;
-
-		if ( params.accumulate && ! params.pause ) {
-
-			const w = target1.width;
-			const h = target1.height;
-			camera.setViewOffset(
-				w, h,
-				Math.random() - 0.5, Math.random() - 0.5,
-				w, h,
-			);
-
-		}
-
-		renderer.setRenderTarget( target1 );
-		renderer.render( scene, camera );
-
-		renderer.setRenderTarget( target2 );
-		renderer.autoClear = false;
-		fsQuad.material.map = target1.texture;
-		fsQuad.material.opacity = params.accumulate ? 1 / samples : 1;
-		fsQuad.render( renderer );
-		renderer.autoClear = true;
-
-	}
-
-	// render to screen
-	renderer.setRenderTarget( null );
-	fsQuad.material.map = target2.texture;
-	fsQuad.material.opacity = 1;
-	fsQuad.render( renderer );
-
-	samplesEl.innerText = `Samples: ${ totalSamples }`;
-
+{
+    "asset": {
+        "version": "2.0",
+        "generator": "babylon.js glTF exporter for Maya 2018 v20200228.3 (with minor hand modifications)"
+    },
+    "scene": 0,
+    "scenes": [
+        {
+            "nodes": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5
+            ]
+        }
+    ],
+    "nodes": [
+        {
+            "mesh": 0,
+            "name": "Hose_low"
+        },
+        {
+            "mesh": 1,
+            "name": "RubberWood_low"
+        },
+        {
+            "mesh": 2,
+            "name": "GlassPlastic_low"
+        },
+        {
+            "mesh": 3,
+            "name": "MetalParts_low"
+        },
+        {
+            "mesh": 4,
+            "name": "LeatherParts_low"
+        },
+        {
+            "mesh": 5,
+            "name": "Lenses_low"
+        }
+    ],
+    "meshes": [
+        {
+            "primitives": [
+                {
+                    "attributes": {
+                        "POSITION": 1,
+                        "TANGENT": 2,
+                        "NORMAL": 3,
+                        "TEXCOORD_0": 4
+                    },
+                    "indices": 0,
+                    "material": 0
+                }
+            ],
+            "name": "Hose_low"
+        },
+        {
+            "primitives": [
+                {
+                    "attributes": {
+                        "POSITION": 6,
+                        "TANGENT": 7,
+                        "NORMAL": 8,
+                        "TEXCOORD_0": 9
+                    },
+                    "indices": 5,
+                    "material": 1
+                }
+            ],
+            "name": "RubberWood_low"
+        },
+        {
+            "primitives": [
+                {
+                    "attributes": {
+                        "POSITION": 11,
+                        "TANGENT": 12,
+                        "NORMAL": 13,
+                        "TEXCOORD_0": 14
+                    },
+                    "indices": 10,
+                    "material": 2
+                }
+            ],
+            "name": "GlassPlastic_low"
+        },
+        {
+            "primitives": [
+                {
+                    "attributes": {
+                        "POSITION": 16,
+                        "TANGENT": 17,
+                        "NORMAL": 18,
+                        "TEXCOORD_0": 19
+                    },
+                    "indices": 15,
+                    "material": 3
+                }
+            ],
+            "name": "MetalParts_low"
+        },
+        {
+            "primitives": [
+                {
+                    "attributes": {
+                        "POSITION": 21,
+                        "TANGENT": 22,
+                        "NORMAL": 23,
+                        "TEXCOORD_0": 24
+                    },
+                    "indices": 20,
+                    "material": 4
+                }
+            ],
+            "name": "LeatherParts_low"
+        },
+        {
+            "primitives": [
+                {
+                    "attributes": {
+                        "POSITION": 26,
+                        "TANGENT": 27,
+                        "NORMAL": 28,
+                        "TEXCOORD_0": 29
+                    },
+                    "indices": 25,
+                    "material": 5
+                }
+            ],
+            "name": "Lenses_low"
+        }
+    ],
+    "accessors": [
+        {
+            "bufferView": 0,
+            "componentType": 5123,
+            "count": 59040,
+            "type": "SCALAR",
+            "name": "accessorIndices"
+        },
+        {
+            "bufferView": 1,
+            "componentType": 5126,
+            "count": 10472,
+            "max": [
+                0.10810829,
+                0.356580257,
+                0.190409869
+            ],
+            "min": [
+                -0.07221258,
+                0.104120225,
+                -0.088394776
+            ],
+            "type": "VEC3",
+            "name": "accessorPositions"
+        },
+        {
+            "bufferView": 2,
+            "componentType": 5126,
+            "count": 10472,
+            "type": "VEC4",
+            "name": "accessorTangents"
+        },
+        {
+            "bufferView": 1,
+            "byteOffset": 125664,
+            "componentType": 5126,
+            "count": 10472,
+            "type": "VEC3",
+            "name": "accessorNormals"
+        },
+        {
+            "bufferView": 3,
+            "componentType": 5126,
+            "count": 10472,
+            "type": "VEC2",
+            "name": "accessorUVs"
+        },
+        {
+            "bufferView": 0,
+            "byteOffset": 118080,
+            "componentType": 5123,
+            "count": 72534,
+            "type": "SCALAR",
+            "name": "accessorIndices"
+        },
+        {
+            "bufferView": 1,
+            "byteOffset": 251328,
+            "componentType": 5126,
+            "count": 13638,
+            "max": [
+                0.162940636,
+                0.7025226,
+                0.200029165
+            ],
+            "min": [
+                -0.158857465,
+                -2.14242937E-05,
+                -0.171545789
+            ],
+            "type": "VEC3",
+            "name": "accessorPositions"
+        },
+        {
+            "bufferView": 2,
+            "byteOffset": 167552,
+            "componentType": 5126,
+            "count": 13638,
+            "type": "VEC4",
+            "name": "accessorTangents"
+        },
+        {
+            "bufferView": 1,
+            "byteOffset": 414984,
+            "componentType": 5126,
+            "count": 13638,
+            "type": "VEC3",
+            "name": "accessorNormals"
+        },
+        {
+            "bufferView": 3,
+            "byteOffset": 83776,
+            "componentType": 5126,
+            "count": 13638,
+            "type": "VEC2",
+            "name": "accessorUVs"
+        },
+        {
+            "bufferView": 0,
+            "byteOffset": 263148,
+            "componentType": 5123,
+            "count": 24408,
+            "type": "SCALAR",
+            "name": "accessorIndices"
+        },
+        {
+            "bufferView": 1,
+            "byteOffset": 578640,
+            "componentType": 5126,
+            "count": 4676,
+            "max": [
+                0.140494063,
+                0.61828655,
+                0.147373646
+            ],
+            "min": [
+                -0.140846014,
+                0.440957,
+                -0.107818365
+            ],
+            "type": "VEC3",
+            "name": "accessorPositions"
+        },
+        {
+            "bufferView": 2,
+            "byteOffset": 385760,
+            "componentType": 5126,
+            "count": 4676,
+            "type": "VEC4",
+            "name": "accessorTangents"
+        },
+        {
+            "bufferView": 1,
+            "byteOffset": 634752,
+            "componentType": 5126,
+            "count": 4676,
+            "type": "VEC3",
+            "name": "accessorNormals"
+        },
+        {
+            "bufferView": 3,
+            "byteOffset": 192880,
+            "componentType": 5126,
+            "count": 4676,
+            "type": "VEC2",
+            "name": "accessorUVs"
+        },
+        {
+            "bufferView": 0,
+            "byteOffset": 311964,
+            "componentType": 5123,
+            "count": 60288,
+            "type": "SCALAR",
+            "name": "accessorIndices"
+        },
+        {
+            "bufferView": 1,
+            "byteOffset": 690864,
+            "componentType": 5126,
+            "count": 13636,
+            "max": [
+                0.132708371,
+                0.6024364,
+                0.199477077
+            ],
+            "min": [
+                -0.203642711,
+                0.02116075,
+                -0.147512689
+            ],
+            "type": "VEC3",
+            "name": "accessorPositions"
+        },
+        {
+            "bufferView": 2,
+            "byteOffset": 460576,
+            "componentType": 5126,
+            "count": 13636,
+            "type": "VEC4",
+            "name": "accessorTangents"
+        },
+        {
+            "bufferView": 1,
+            "byteOffset": 854496,
+            "componentType": 5126,
+            "count": 13636,
+            "type": "VEC3",
+            "name": "accessorNormals"
+        },
+        {
+            "bufferView": 3,
+            "byteOffset": 230288,
+            "componentType": 5126,
+            "count": 13636,
+            "type": "VEC2",
+            "name": "accessorUVs"
+        },
+        {
+            "bufferView": 0,
+            "byteOffset": 432540,
+            "componentType": 5123,
+            "count": 65688,
+            "type": "SCALAR",
+            "name": "accessorIndices"
+        },
+        {
+            "bufferView": 1,
+            "byteOffset": 1018128,
+            "componentType": 5126,
+            "count": 12534,
+            "max": [
+                0.124933377,
+                0.716000438,
+                0.129168555
+            ],
+            "min": [
+                -0.125863016,
+                0.2958266,
+                -0.1541516
+            ],
+            "type": "VEC3",
+            "name": "accessorPositions"
+        },
+        {
+            "bufferView": 2,
+            "byteOffset": 678752,
+            "componentType": 5126,
+            "count": 12534,
+            "type": "VEC4",
+            "name": "accessorTangents"
+        },
+        {
+            "bufferView": 1,
+            "byteOffset": 1168536,
+            "componentType": 5126,
+            "count": 12534,
+            "type": "VEC3",
+            "name": "accessorNormals"
+        },
+        {
+            "bufferView": 3,
+            "byteOffset": 339376,
+            "componentType": 5126,
+            "count": 12534,
+            "type": "VEC2",
+            "name": "accessorUVs"
+        },
+        {
+            "bufferView": 0,
+            "byteOffset": 563916,
+            "componentType": 5123,
+            "count": 2208,
+            "type": "SCALAR",
+            "name": "accessorIndices"
+        },
+        {
+            "bufferView": 1,
+            "byteOffset": 1318944,
+            "componentType": 5126,
+            "count": 436,
+            "max": [
+                0.101920746,
+                0.5936986,
+                0.152926728
+            ],
+            "min": [
+                -0.101920947,
+                0.5300429,
+                0.090174824
+            ],
+            "type": "VEC3",
+            "name": "accessorPositions"
+        },
+        {
+            "bufferView": 2,
+            "byteOffset": 879296,
+            "componentType": 5126,
+            "count": 436,
+            "type": "VEC4",
+            "name": "accessorTangents"
+        },
+        {
+            "bufferView": 1,
+            "byteOffset": 1324176,
+            "componentType": 5126,
+            "count": 436,
+            "type": "VEC3",
+            "name": "accessorNormals"
+        },
+        {
+            "bufferView": 3,
+            "byteOffset": 439648,
+            "componentType": 5126,
+            "count": 436,
+            "type": "VEC2",
+            "name": "accessorUVs"
+        }
+    ],
+    "bufferViews": [
+        {
+            "buffer": 0,
+            "byteLength": 568332,
+            "name": "bufferViewScalar"
+        },
+        {
+            "buffer": 0,
+            "byteOffset": 568332,
+            "byteLength": 1329408,
+            "byteStride": 12,
+            "name": "bufferViewFloatVec3"
+        },
+        {
+            "buffer": 0,
+            "byteOffset": 1897740,
+            "byteLength": 886272,
+            "byteStride": 16,
+            "name": "bufferViewFloatVec4"
+        },
+        {
+            "buffer": 0,
+            "byteOffset": 2784012,
+            "byteLength": 443136,
+            "byteStride": 8,
+            "name": "bufferViewFloatVec2"
+        }
+    ],
+    "buffers": [
+        {
+            "uri": "FlightHelmet.bin",
+            "byteLength": 3227148
+        }
+    ],
+    "materials": [
+        {
+            "pbrMetallicRoughness": {
+                "baseColorTexture": {
+                    "index": 2
+                },
+                "metallicRoughnessTexture": {
+                    "index": 1
+                }
+            },
+            "normalTexture": {
+                "index": 0
+            },
+            "occlusionTexture": {
+                "index": 1
+            },
+            "doubleSided": true,
+            "name": "HoseMat"
+        },
+        {
+            "pbrMetallicRoughness": {
+                "baseColorTexture": {
+                    "index": 2
+                },
+                "metallicRoughnessTexture": {
+                    "index": 1
+                }
+            },
+            "normalTexture": {
+                "index": 0
+            },
+            "occlusionTexture": {
+                "index": 1
+            },
+            "name": "RubberWoodMat"
+        },
+        {
+            "pbrMetallicRoughness": {
+                "baseColorTexture": {
+                    "index": 5
+                },
+                "metallicRoughnessTexture": {
+                    "index": 4
+                }
+            },
+            "normalTexture": {
+                "index": 3
+            },
+            "occlusionTexture": {
+                "index": 4
+            },
+            "name": "GlassPlasticMat"
+        },
+        {
+            "pbrMetallicRoughness": {
+                "baseColorTexture": {
+                    "index": 8
+                },
+                "metallicRoughnessTexture": {
+                    "index": 7
+                }
+            },
+            "normalTexture": {
+                "index": 6
+            },
+            "occlusionTexture": {
+                "index": 7
+            },
+            "name": "MetalPartsMat"
+        },
+        {
+            "pbrMetallicRoughness": {
+                "baseColorTexture": {
+                    "index": 11
+                },
+                "metallicRoughnessTexture": {
+                    "index": 10
+                }
+            },
+            "normalTexture": {
+                "index": 9
+            },
+            "occlusionTexture": {
+                "index": 10
+            },
+            "name": "LeatherPartsMat"
+        },
+        {
+            "pbrMetallicRoughness": {
+                "baseColorTexture": {
+                    "index": 14
+                },
+                "metallicRoughnessTexture": {
+                    "index": 13
+                }
+            },
+            "normalTexture": {
+                "index": 12
+            },
+            "occlusionTexture": {
+                "index": 13
+            },
+            "alphaMode": "BLEND",
+            "name": "LensesMat"
+        }
+    ],
+    "textures": [
+        {
+            "sampler": 0,
+            "source": 0,
+            "name": "FlightHelmet_Materials_RubberWoodMat_Normal.png"
+        },
+        {
+            "sampler": 0,
+            "source": 1,
+            "name": "FlightHelmet_Materials_RubberWoodMat_OcclusionRoughMetal.png"
+        },
+        {
+            "sampler": 0,
+            "source": 2,
+            "name": "FlightHelmet_Materials_RubberWoodMat_BaseColor.png"
+        },
+        {
+            "sampler": 0,
+            "source": 3,
+            "name": "FlightHelmet_Materials_GlassPlasticMat_Normal.png"
+        },
+        {
+            "sampler": 0,
+            "source": 4,
+            "name": "FlightHelmet_Materials_GlassPlasticMat_OcclusionRoughMetal.png"
+        },
+        {
+            "sampler": 0,
+            "source": 5,
+            "name": "FlightHelmet_Materials_GlassPlasticMat_BaseColor.png"
+        },
+        {
+            "sampler": 0,
+            "source": 6,
+            "name": "FlightHelmet_Materials_MetalPartsMat_Normal.png"
+        },
+        {
+            "sampler": 0,
+            "source": 7,
+            "name": "FlightHelmet_Materials_MetalPartsMat_OcclusionRoughMetal.png"
+        },
+        {
+            "sampler": 0,
+            "source": 8,
+            "name": "FlightHelmet_Materials_MetalPartsMat_BaseColor.png"
+        },
+        {
+            "sampler": 0,
+            "source": 9,
+            "name": "FlightHelmet_Materials_LeatherPartsMat_Normal.png"
+        },
+        {
+            "sampler": 0,
+            "source": 10,
+            "name": "FlightHelmet_Materials_LeatherPartsMat_OcclusionRoughMetal.png"
+        },
+        {
+            "sampler": 0,
+            "source": 11,
+            "name": "FlightHelmet_Materials_LeatherPartsMat_BaseColor.png"
+        },
+        {
+            "sampler": 0,
+            "source": 12,
+            "name": "FlightHelmet_Materials_LensesMat_Normal.png"
+        },
+        {
+            "sampler": 0,
+            "source": 13,
+            "name": "FlightHelmet_Materials_LensesMat_OcclusionRoughMetal.png"
+        },
+        {
+            "sampler": 0,
+            "source": 14,
+            "name": "FlightHelmet_Materials_LensesMat_BaseColor.png"
+        }
+    ],
+    "images": [
+        {
+            "uri": "FlightHelmet_Materials_RubberWoodMat_Normal.png"
+        },
+        {
+            "uri": "FlightHelmet_Materials_RubberWoodMat_OcclusionRoughMetal.png"
+        },
+        {
+            "uri": "FlightHelmet_Materials_RubberWoodMat_BaseColor.png"
+        },
+        {
+            "uri": "FlightHelmet_Materials_GlassPlasticMat_Normal.png"
+        },
+        {
+            "uri": "FlightHelmet_Materials_GlassPlasticMat_OcclusionRoughMetal.png"
+        },
+        {
+            "uri": "FlightHelmet_Materials_GlassPlasticMat_BaseColor.png"
+        },
+        {
+            "uri": "FlightHelmet_Materials_MetalPartsMat_Normal.png"
+        },
+        {
+            "uri": "FlightHelmet_Materials_MetalPartsMat_OcclusionRoughMetal.png"
+        },
+        {
+            "uri": "FlightHelmet_Materials_MetalPartsMat_BaseColor.png"
+        },
+        {
+            "uri": "FlightHelmet_Materials_LeatherPartsMat_Normal.png"
+        },
+        {
+            "uri": "FlightHelmet_Materials_LeatherPartsMat_OcclusionRoughMetal.png"
+        },
+        {
+            "uri": "FlightHelmet_Materials_LeatherPartsMat_BaseColor.png"
+        },
+        {
+            "uri": "FlightHelmet_Materials_LensesMat_Normal.png"
+        },
+        {
+            "uri": "FlightHelmet_Materials_LensesMat_OcclusionRoughMetal.png"
+        },
+        {
+            "uri": "FlightHelmet_Materials_LensesMat_BaseColor.png"
+        }
+    ],
+    "samplers": [
+        {
+            "magFilter": 9729,
+            "minFilter": 9987
+        }
+    ]
 }
